@@ -1,0 +1,208 @@
+---
+title: "Query neo4j on salmosphere"
+author: "Scott Akenhead scott@s4s.com 1-250-210-4410"
+date: '`r format(Sys.Date(),"%Y %B %d")`'
+output:
+  html_notebook: 
+    highlight: pygments
+    number_sections: yes
+    theme: journal
+    toc: yes
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+#library(jsonlite, quietly=T);
+library(knitr, quietly=T);
+#library(ggplot2, quietly=T); 
+library(magrittr, quietly=T);
+#library(googlesheets, quietly=T);
+#library(openssl, quietly=T);
+#library(visNetwork, quietly=T); 
+library(RNeo4j, quietly=T);  # note caps
+
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	comment = "",
+	results = "hold")
+options(digits=5, show.error.locations=T, stringsAsFactors=F);
+```
+
+## Local Functions
+An effort is made to co-locate the functions used in the subsequent R code. An effort assist others with similar work. Including myself after I forget this. 
+
+```{r local, echo=T}
+cat("working directory:",getwd(),"\n");
+col=c("skyblue","peachpuff","chartreuse", "seagreen") 
+# rip up your guy card
+
+# my functions start with a capital: CamelCase.
+# Variables are pythonCase unless they are a **Resource** in RoundTable.
+
+AddUID = function(a){
+    # add or update a column named "ID" in a data.frame
+    # numbering starts as lastUID+1
+    # lastUID is inherited from parent environment (be careful!).
+    last <- lastUID; 
+    n <-  dim(a)[1]; # n rows
+    a$ID <- seq.int(from=last+1,to=last+n, by=1)
+    lastUID <<- last+n;  # changes lastUID in parent environment (!)
+    return(a);  # modified
+    # examples: 
+    #   a <- AddUID(a)
+    #   a %<>% AddUID # using maggritr pipe 
+}
+
+#Macro=function(txt) eval(parse(text=txt)); # execute text
+#MakeUID=function(n=1){
+#    make1=function() paste0(sample(c(LETTERS),9,replace=T),collapse='');
+#    if (n == 1) return(make1());
+#    uid=character(n)
+#    for(j in 1:n) uid[j] <- make1()
+#    return(uid)
+#}
+
+SampleRows <- function(a,caption=NA, nrows=10, ...){
+    # prints a random sample of rows
+    # you can pass "col.names" and other controls for kable().
+    n1=dim(a)[1];    n2=min(nrows,n1)
+    j <- sort(sample.int(n1,n2)) 
+    kable(a[j, ], caption=caption,...); # keeps row number
+}
+```
+
+# Introduction
+Objectives: 
+1. open SalmoSphere.Net as super user.  
+2. start neo4j database engine. Start a knowledge graph.  
+3. create a node by a simple query:  
+>CREATE (:Person{ID:1, nameString:"Hello World", }) -[hasActivity{type:"y", ID:2}]->
+ (:Activity{name:"z",type:"",description:"", ID:3})
+
+# Open SalmoSphere.Net
+salmosphere.net, 71.19.255.237 (ECDSA)  
+via Tom Nightingale at Affinity Bridge: 
+>ssh -p 22222 salmosphere@salmosphere.net 
+salmosphere@salmosphere.net's password: 
+ J4Qxs6637dsDAf9p  
+>Linux ladysmith01 4.9.0-6-amd64 #1 SMP Debian 4.9.82-1+deb9u3 (2018-03-02) x86_64  
+Last login: Fri Mar  2 11:01:53 2018 from 97.107.183.7
+Mon Apr 30 10:08:05
+salmosphere@ladysmith01:~# 
+
+
+>You can access the server via ssh (port 22222) with credentials:  
+Web user: salmosphere / J4Qxs6637dsDAf9p  affinitybridge
+Sudo user: roundtable / umb74NtgjqdJmFwTaxu7l2kjT the default Structr admin account creds:  admin / gi7ZZ9V62gfxe89e  
+salmosphere.net:8082/structr admin/gi...  
+
+The file locations on Debian Linux are described at 
+>https://neo4j.com/docs/operations-manual/current/configuration/file-locations/
+
+Configuration /etc/neo4j/neo4j.conf
+Data    /var/lib/neo4j/data
+Logs    /var/log/neo4j	
+Metrics /var/lib/neo4j/metrics
+Import  /var/lib/neo4j/import
+Bin     /usr/bin
+Lib     /usr/share/neo4j/lib
+Plugins /var/lib/neo4j/plugins
+
+But this is embedded in Structr:
+>salmosphere@ladysmith01:/usr/lib/structr/lib# 
+salmosphere@ladysmith01:/usr/lib/structr# cat structr.conf
+superuser.password = 4oXdm3hEISPC
+application.proxy.http.url = salmosphere.org
+CsvServlet.path = /s/structr/csv/*
+JsonRestServlet.path = /s/structr/rest/*
+HtmlServlet.path = /s/structr/html/*
+WebSocketServlet.path = /s/structr/ws/*
+UploadServlet.path = /s/structr/upload
+
+## installing neo4j on SalmoSphere.net 
+https://neo4j.com/docs/operations-manual/current/installation/linux/debian/  
+https://support.structr.com/article/48
+
+## How to start Neo4j database on local Mac
+The Neo4j database process must be **started** from Applications or LaunchPad on Mac. The error messages from Neo4j are cryptic. The following means "You forgot to start Neo4j."  
+>Error in stop_for_content_type(req, expected = "application/atom+xml; charset=UTF-8") : 
+Expected content-type:
+application/atom+xml; charset=UTF-8
+Actual content-type:
+text/html; charset=UTF-8
+
+Within R The default database is named *graph* and is **opened** at the default location:
+>/Users/Scott2/Documents/Neo4j/default.graphdb  
+
+with
+>username="neo4j", password="GaB-EX8-Rbx-Ny7")
+
+Remove authentication to more easily start a knowledge graph in R, **as I did**:  
+1. find file: /Users/Scott2/Documents/Neo4j/.neo4j.conf  
+   use command-shift-. to see hidden files (obscure Mac trick)
+2. find line: dbms.security.auth_enabled=true
+3. edit "true" to be "false"
+
+I actually started Neo4j at 
+> /Users/Scott2/Documents/Neo4j/salmosphere.graphdb.
+
+This did not require changing the following URL to "open" the knowledge graph inside of R. 
+
+```{r openDB}
+#graph = startGraph("http://localhost:7474/db/data/")
+#salmosphere = startGraph("http://localhost:7474/db/data/")
+```
+This next chunk deletes the previous version of your database (but not neo4j app).
+If there is a previous db, you will need to respond "Y" in the Rstudio console to permit this. 
+
+```{r clearDB, message=TRUE}
+#clear(graph) # else old graph persists. answer with capital Y
+```
+## Entering SalmoSphere.Net
+
+# Load the Knowledge Graph
+## Constraints
+Preventing duplication of nodes is enforce by *addConstraint* where the key is some field in the node that will be unique, such as an email. Note that two people can have the same name (but not email), so we **will** need to add a unique identifier to Person to ensure uniqueness and enable constraint (e.g. email for a specific person).  I used rneo4j::addConstraint, a function that is the equivalent of the Cypher query:
+>CREATE CONSTRAINT ON (p:Person)
+       ASSERT p.name IS UNIQUE
+
+```{r constrain,message=TRUE}
+# prevent duplication of nodes
+addConstraint(graph, label="Person",         key="name")
+addConstraint(graph, label="Place",          key="name")
+addConstraint(graph, label="Activity",       key="nameShort")
+addConstraint(graph, label="Organization",   key="nameShort")
+addConstraint(graph, label="ContactService", key="email")
+getConstraint(graph) # all
+```
+
+## Person Has ContactService 
+To avoid duplicating nodes, I created the nodes first, along with links to nodes that are unique to a new node, e.g. Person has contactService. Subsequently I MATCH existing nodes to create relationships. This has the advantage of using rNeo4j syntax which is simpler than Cypher queries.
+```{r oneP}
+# create one Person
+p <- createNode(graph,"Person", 
+ID = 9876543210,
+resourceNodeTypeID = 11210,
+resourceNodeSubTypeID = 1,
+label ="Hello World", 
+namestring = "Mr. Hello New (Hi) World jr, PhD",
+prefix = "Mr.",
+firstNamesOrInitials ="Hello",
+middleNamesOrInitials = "New",
+familyName = "World",
+familySuffix = "jr.",
+honorificSuffix = "PhD",
+description = "The one and only, the node you love, give it up for Hello World!",
+status = "active",
+start_date = "2018-01-01",
+end_date = "2018-12-31")
+```
+
+# Queries for Examples of all Nodes and Edges
+A new of everything to as a test bed for data binding between neo4j, Structr, and javascript in RoundTable.
+```{r exampleNodes}
+dir="/Users/Scott/Documents/Projects/SalmoSphere/data"
+
+
+```
