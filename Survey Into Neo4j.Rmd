@@ -1,0 +1,1627 @@
+---
+title: "Nodes and Links from DFO Salmon Network Survey 2017 October "
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '2'
+  html_notebook:
+    highlight: pygments
+    number_sections: yes
+    theme: journal
+    toc: yes
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+library(jsonlite);
+library(knitr);
+library(magrittr);
+library(RNeo4j);  # note caps
+
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	comment = "",
+	results = "hold")
+options(digits=5, show.error.locations=T, stringsAsFactors=F);
+```
+
+
+# Local Functions
+An effort is made to co-locate the functions used in the subsequent R code. This might assist others with similar work.  My function names are **CamelCase**, my variables are **pythonCase** unless they are *Resource* nodes in RoundTable.
+
+```{r local}
+cat("working directory:",getwd(),"\n");
+
+# increment a counter, add 1 to it.
+I <- function(j)j<-j+1L # increment: j<-I(j) or j%<>%I
+# increment the variable j, add 1 to j in globalEnvironment
+Ij<-function()j<<-(j+1) # increment j: j<-8;Ij();j; # 9
+
+Cat<-function(...) cat(..., sep=", ", "\n");
+
+cardcol=c("skyblue","peachpuff","chartreuse", "seagreen") 
+        # hands in guy card
+
+ColNames <- function(a){
+    b=get(a);
+    cat("\n",a,"has",dim(b)[1],"rows and", dim(b)[2],"columns:\n", colnames(b),"\n")
+}
+
+AddUID = function(a){
+# add (or update) a column named ID in a data.frame with
+# sequential unique ID values, starting from lastUID + 1.
+    n <-  dim(a)[1]; 
+    last <- lastUID; # lastUID inherited 
+    cat(sep="", "lastUID was ",lastUID,", now adding ",n," more.\n");
+    a$ID <- seq.int(from=last+1,to=last+n, by=1)
+    lastUID <<- last+n;  # changes lastUID in parent environment
+    cat("lastUID is ",lastUID,"\n");
+    return(a);  # modified
+# examples 
+#   a <- AddUID(a)
+#   a %<>% AddUID # ditto with maggritr pipe 
+}
+
+#Macro=function(txt) eval(parse(text=txt)); # execute text
+
+#MakeUID=function(n=1){
+#    make1=function() paste0(sample(c(LETTERS),9,replace=T),collapse='');
+#    if (n == 1) return(make1());
+#   uid=character(n)
+#    for(j in 1:n) uid[j] <- make1()
+#    return(uid)
+#}
+
+SampleRows <- function(a,caption=NA, nrows=10, ...){
+    # prints a random sample of rows
+    # you can pass "col.names" and other controls for kable().
+    n1=dim(a)[1];    n2=min(nrows,n1)
+    j <- sort(sample.int(n1,n2)) 
+    kable(a[j, ], caption=caption,...); # keeps row number
+}
+
+DeDuplicate <- function(a){
+# a is a data.frame with fields 1:"name" and 2:"description".
+# duplicated names are removed.
+# multiple descriptions for same name are concatenated.
+    a <- a[(a[,1] != "") ,]  # delete empty names
+    a <- a[order(a[,1])  ,]  # put duplicate names together
+    a[is.na(a[,2]),2] <- ""; # change NA to empty
+    #print(a)
+    d <- a  # for result
+    k=1 # counter for result, d, with unique names.
+for(j in 2:dim(a)[1]){
+    if(a[j,1] == d[k,1]){  # duplicate name
+# no description in duplicate, discard
+        if(a[j,2] =="") next;
+# description in duplicate, save it
+# unless identical to what is saved. Note a+a ->a, but ba+a -> baa.
+        if(d[k,2] != a[j,2])
+d[k,2] <- paste0(d[k,2],a[j,2]);
+        next;
+    } # end if duplicate
+    k %<>%I; 
+    d[k,] <- a[j,] # save first, with all columns
+} # end for
+    return(d[1:k,]); # lose trailing blank rows
+}
+# test:
+a <- data.frame( bark=
+            c("A","A","A", "B", "","C","C","C","C","C","E"),
+meow=c("a", "","b",  "", "","", "c","c","d", NA,""));
+b <- DeDuplicate(a); b # A:ab,B:,C:cd,E:
+
+ResourceID = function(text){
+    j=match(text,hash.resource$resource); # inherits hash.resource
+    id=as.integer(hash.resource[j,"code"]); # not a string
+    return(id);
+}
+
+AddSpecialField <- function (a=nodeTemplate, b=specialField){
+    # adds named columns as text field to data.frame for a node
+    # example: addSpecialField() # default use, 1 row.
+    y <- data.frame(t(character(length(b))))
+    colnames(y) <- b
+    res <-cbind(a,y)
+    return(res)
+}
+
+QueryCreateNode <- function (nodeName,b,doPrint=T){
+# make Cypher queries to CREATE nodes from data.frame named b. 
+# the first paste() produces:
+# resourceNodeTypeID:'1',resourceNodeSubTypeID:'1',ID:'1',label:'',name:'',description:'',status:'active',start_date:'2000-01-01',end_date:'2099-12-31',nameString:'',first_name:'',last_name:'
+# 2018-8-20 fixed so first three fields are numbers as 1 not 
+# strings as '1' so 
+# resourceNodeTypeID:1,resourceNodeSubTypeID:1,ID:1,    
+  n <- dim(b)[1];  # how many rows
+  query <- character(n)
+  fld=colnames(b); 
+  nf <-length(fld); # how many columns hence fields
+  for(j in 1:n){
+    #txt <- paste(sep=":'", fld,       b[j,],    collapse="', " );#OLD
+    txt1 <- paste(sep=":",  fld[1:3],  b[j,1:3], collapse=", "  );
+    txt2 <- paste(sep=":'", fld[4:nf], b[j,4:nf],collapse="', " );
+    txt= paste(txt1,txt2, sep=", ");
+    query[j] <- paste0( "CREATE (:",nodeName,"{",txt,"'})")
+  }
+  if(doPrint){
+    if(n==1){   print(query[1],     quote=F); # print the one.
+        } else {print(query[c(1,n)],quote=F); # print first and last
+    }
+  }    
+  return(query);
+}
+
+QueryCreateEdge <- function (fromResource,fromID, toResource, toID, linkName, base, doPrint=T){
+# make Cypher queries, to CREATE edges from existing nodes, from a data.frame.
+# fromResource --  Resource name. Not neo4j style: person not Person
+# fromID -- values for ID in fromRT. numeric vector.
+# toResource, toID -- ditto for the To nodes.
+# linkName -- link as defined in RT, e.g. isRelatedTo. 
+#             code for linkName found via linkID().
+# base -- six base fields, {label:"", name:"", description:"", status:"", startDate:"", endDate:""}
+# function requires: linkID().
+# node fields resourceNodeTypeID:'1',resourceNodeSubTypeID:'1' are not required. (?)
+#---    
+#  MATCH (from:Person{ID:fromResourceNodeID}), 
+#        (  to:Person{ID:toResourceNodeID  })
+#  MERGE (from)-[:isRelatedTo{LinkTypeID:1, linkSubTypeID:0,
+#      label:"", name:"", description:"", 
+#      status:"", startDate:"", endDate:""}]->(to)
+#---   
+    lid <- LinkID(linkName);
+    n <- length(fromID)
+    query <- character(n)
+    for (j in 1:n){
+q1 <- paste0('MATCH (from:',fromResource,' {ID:',fromID[j],
+             '}), (to:', toResource,' {ID:',toID[j],'})' )
+q2 <- paste0('MERGE (from)-[:',linkName,
+             ' {LinkTypeID:',     lid,
+             ', linkSubTypeID:',  0,
+             ', label:"',         base[j,1],
+             '", name:"',         base[j,2],
+             '", description:"',  base[j,3],
+             '", status:"',       base[j,4],
+             '", startDate:"',    base[j,5],
+             '", endDate:"',      base[j,6],
+             '"}]->(to)' );
+    #q3 <- 'RETURN to.label, from.label' 
+    query[j] <- paste(q1,q2);
+    } 
+    if(doPrint){ 
+        if(n == 1) print(query[1],     quote=F);
+        if(n != 1) print(query[c(1,n)],quote=F); # print first and last
+    }    
+    return(query);
+}
+
+MakeEdge <- function(from=from, to=to, link=link, type="", description="", doPrint=TRUE){
+# 2018-08-23 added option "RT"" to create dataframe instead, for JSON or CSV
+# 2018-08-23 X-hasY-Y, duplicated fields from nodes X and Y into HasY to 
+# be compliant with RoundTable protocol.
+# 2018-09-07 merged EdgeRT into MakeEdge. No Cypher.    
+    
+# (0) validate names
+    # tmp <- RTcode(from);tmp <- RTcode(to);tmp <- RTcode(link,"link")
+    # if(is.na(RTcode(from))) stop("MakeEdge: bad name for from")
+    # if(is.na(RTcode(to  )))   stop("MakeEdge: bad name for to")
+    # if(is.na(RTcode(link,"link")))   stop("MakeEdge: bad name for link")
+    
+    # echo setup.
+    if (type !=""){ a <- RTcode(link,"link",type=hasY[,type][1]) 
+      } else {a <- RTcode(link,"link")};
+cat("X is Resource",from,"with code", RTcode(from)[1],"and Xlabel",Xlabel,"\n");
+cat("Y is  Resource", to,"with code", RTcode(to)[1]," and Ylabel",Ylabel,"\n");
+cat(sep="", "hasY is Edge ", link," with type \'",type,"\' with codes ",
+    a,", with hasXlabel ",hasXlabel,", and hasYlabel ",hasYlabel,". \n");
+
+# (1) match labels: X, XhasY, Y.  Return fromID, toID.
+    cat("hasY has",dim(hasY)[1],"rows,")
+hasY= hasY[ (hasY[,hasYlabel]!=""), ] # remove rows that are not links
+    cat("of which",dim(hasY)[1],"are links.\n")
+hasY %<>% OrderBy(hasXlabel)          # put "from"s together for efficiency
+paired <- MatchID( X,Xlabel,hasY,hasXlabel,hasYlabel,Y,Ylabel)
+# paired has 7 fields. 3 numeric from X and Y, and logical "missing".
+# id, node, type, id, node, type, missing
+# (2) create content for the link.
+# (2.1) name
+txt=paste0("-",link,"-")     # default is link when no type of link
+if(type !="") {              # a column name for type of link/edge
+  txt=rep(txt, dim(hasY)[1]) # default as vector.
+  j <- hasY[,type] != ""     # where type within link is specified.
+  txt[j] <- paste0("-",hasY[j,type],"-") # replace default with specified.
+}
+name=paste0(hasY[,hasXlabel],txt,hasY[,hasYlabel]);  # Scott-reportsTo-Jim
+# (2.2) description
+if(description !="") description <- hasY[,description];  # column name or empty
+# (2.3) assemble
+base=data.frame(linkLabel=link,name,description, # 8 fields
+                isPrimary="",language="",
+                status="active", start_date="2017-10-24",end_date=""); 
+#
+# (3) Remove cases where MatchID failed. noted in column: missing.
+#     Do that here, so base is correct
+    nm <- sum(paired$missing) 
+    if(nm > 0 ){
+    cat("removing",nm, "rows where MatchID() failed.\n\n")
+    j <- !paired$missing   # link rows that are OK
+    paired <- paired[j,]   # drop ID rows
+    base <-   base[j,]     # drop base rows
+    hasY <-   hasY[j,]     # drop link rows
+}
+#
+# (4) Determine codes for link and type within link. 
+#     May vary by row. Leverage runs.
+#     The variable named 'type' is a field name in hasY. Or "".
+typeCode <- 0L # default
+linkCode <- a[1] # previously matched.
+if(type !="") { # if a column name for type(s) of edge was supplied
+    typeText <- hasY[,type];
+    typeCode <- integer(length(typeText));# allocate
+    lastTypeText  <- "tralfamadore"; lastTypeCode=-1L;
+    for(j in seq_along(typeText)){
+        typeCode[j] <- lastTypeCode # default: previous code
+        if(typeText[j] != lastTypeText){ # different than last.
+            lastTypeText <- typeText[j]
+            lastTypeCode <- RTcode(link,"link",lastTypeText)[2]
+            typeCode[j] <- lastTypeCode 
+        }
+    }
+} 
+# (5) Assemble these pieces into a data.frame with correct column names.
+  rt <- data.frame(linkCode, typeCode,0,   # link, type, ID (added later).
+                   paired[,1:3],           # from, type, ID.
+                   paired[,4:6])           #   to, type, ID. 
+  colnames(rt) <- c(
+  "resourceLinkTypeID","resourceLinkSubTypeID", "ID",
+  "fromResourceNodeID","fromResourceNodeTypeID", "fromResourceNodeSubTypeID",
+    "toResourceNodeID",  "toResourceNodeTypeID",   "toResourceNodeSubTypeID"); # 9
+rt <- cbind(rt,base)  # add 8 (or so) columns, total is 17.
+# assumes base has colnames such as: "linkLabel", "name", "description", "isPrimary", "language", "status","start_date","end_date".
+  if(doPrint){ 
+    n <- dim(rt)[1]
+    if(n == 1) print(rt[1,],     quote=F); # print the one
+    if(n != 1) print(rt[c(1,n),],quote=F); # print first and last
+  }    
+  return(rt);
+}
+
+MatchID <- function (X, Xlabel="label", hasY, hasXlabel, hasYlabel, Y, Ylabel="label"){
+# assumes X and Y have fields: ID, resourceNodeTypeID, resourceNodeSubTypeID.
+# avoid unneeded calls to match("from"), typically one "from" has many "to".
+  n=dim(hasY)[1]  # number of links
+  fromID <- integer(n);
+  # allocate result, rows by fromID.
+  a <- data.frame(fromID, fromResourceNodeTypeID=0L, fromResourceNodeSubTypeID=0L,
+                  toID=0L, toResourceNodeTypeID=0L, toResourceNodeSubTypeID=0L);
+  fields <- c("ID","resourceNodeTypeID","resourceNodeSubTypeID")
+  lastFromLabel <- "zyxvwuts";   # dummy
+  lastFrom <- rep(0L,3);         # dummy
+# previously sorted by "from" to avoid unnecessary calls to match().
+# rewrite to avoid all match(from) ... later.
+  for(j in 1:n){           # each link, each hasY
+    a[j,1:3] <- lastFrom;  # 3 fields. first time is dummy but replaced. 
+    thisFromLabel  <- hasY[j, hasXlabel];
+    if(thisFromLabel != lastFromLabel){            # new?
+      fromRow <- match(thisFromLabel,X[,Xlabel]);  # find row in X
+      a[j,1:3] <- X[fromRow,fields];
+#c("ID","resourceNodeTypeID","resourceNodeSubTypeID");
+      lastFrom <- a[j,1:3];
+      lastFromLabel <- thisFromLabel;
+    }
+    toRow <-match( hasY[j,hasYlabel], Y[,Ylabel]);  # could be NA
+    a[j,4:6] <- Y[toRow,fields];
+#c("ID","resourceNodeTypeID", "resourceNodeSubTypeID")];
+  }  # end for
+  j <- (is.na(a[,1]) | is.na(a[,4]) ); # any ID missing?
+  if(sum(j) > 0){                      # are all labels matched?
+    cat("MatchID:", sum(j),"rows not matched, as follows (max 6): \n"); 
+    j1 <- which(j);  # the fails
+    for(k in 1:min(6,sum(j)) ){ 
+      k1=j1[k];
+      cat("hasY row:",k1, 
+      "from:", hasY[k1,hasXlabel], "fromID:", a[k1,1],
+      "to:  ", hasY[k1,hasYlabel], "toID:",   a[k1,4],"\n");
+    }    
+  }  # end if
+  a <- cbind(a,missing=j) ; # add new column to indicate missing 
+  return(a); 
+}
+
+OrderBy <- function(a,field){ 
+# max 3 fields within a to sort a.
+    n <- length(field)
+    if(n>3) n <- 3
+    switch(n, a <- a[order(a[,field]),],
+              a <- a[order(a[,field[1]], a[,field[2]]),],
+              a <- a[order(a[,field[1]], a[,field[2]], a[,field[3]]),]);
+    return(a)
+}
+# example
+# b <- data.frame( dog=1:6, bird=c("a","b","a","b","a","b"),
+#                  fish=c("y","y","y","x","x","x") )
+# a <- c("bird", "fish")
+# b %<>% OrderBy("fish"); b$dog; # 5 4 6 1 3 2
+# b %<>% OrderBy(a); b$dog; # 5 1 3 4 6 2
+
+EchoXhY <- function(){  # for brevity
+    cat("from",  from, "\n", colnames(X),"\n");
+    cat("\nlink",link, "\n", colnames(hasY),"\n");
+    cat("\nto",  to,   "\n", colnames(Y),"\n\n");
+}
+
+```
+
+
+# Introduction
+## Source
+The 2017 October survey of DFO salmon staff were previously edited and unpacked into .csv tables via R notebook *Survey as Sheets Into R.Rmd*. The objective of this R notebook is a neo4j database for version 0.1 of RoundTable^tm^ on SalmoSphere.net. 
+
+## Queries
+For an example of the Cypher queries to load neo4j from those tables, a **Person** named "x" and could be created as
+
+> CREATE (:Person{ID:1, label:"x",type:"",description:""})
+
+Similarly for an **Activity** named "z".  
+
+> CREATE (:Activity{ID:3, label:"z",type:"",description:"" })
+
+These nodes might be linked according to rows in PersonHasActivity.csv that mention x and z. Creating the link requires matching the labels between the previously created node for **Person** and description of the link in PersonHasActivity. Once found, that allows the link to be created with just the reference to the IDs. The first step is to identify those nodes, and the second step is to create the link without duplicating the nodes (MERGE instead of CREATE). This could be applied as
+
+> MATCH (p:Person{ID:1}), (a:Activity{ID:3})  
+MERGE (p) -[:hasActivity{type:"y", description:"x hasActivity y"}]-> (a)  
+RETURN p.label, a.label
+
+## Nodes
+The "Resources" collected were: **Person, Idea, ContactService, Activity, Organization, WebPage, WorkGroup, Place, Address, Event, Map, Doc, Citation, MetaData,** and **Model**.
+Note: Site and Location are defunct. Place contains GIS data but Address does not, however Address fields such as _locale_ and _region_ can be (somehow) be references to Place such as "Ladysmith" and "British Columbia". 
+
+Nodes all contain the same 9 base fields, and ideosyncratic special fields. THe base fields are:  
+1. ID - unique across all nodes,  
+2. resourceID - e.g. for Place,  
+3. typeID - e.g. for marine places,  
+4. label - short and hopefully unique, important for links and display.  
+5. name - longer, used as the header for description.  
+6. description -  
+7. status - typically "active" but other values can be critically important.  
+8. startDate - dates are ISO 6801, e.g. 2018-12-31T23:59+0800 in Pacific time zone.  
+9. endDate -  
+
+## Links
+Only one-way links are created in neo4j, but can then be treated as two-way links between nodes, allowing
+
+> (:Activity)-[hasActivity]-(:Person)
+
+and allowing links independent of direction or type of link, and patterns involving multiple links. The following would identify Activity nodes that shared at least one Person node
+
+> (:Activity)--(:Person)--(:Activity)
+
+Thus **PersonHasOrg** is equivalent to **OrgHasPerson**, etc. If the most important nodes are Person, Activity, Organization, Place, Address, ContactService, Event, and Idea then about 26 links are important, as in the following table. Edge types are implied, x-hasY- Y.  The content of links is important _type, label, name description, status, startDate, endDate_. Not all links are required:**Place** may or may not not have a **ContactService,** and some are not advised: **Address** can typically be avoided for **Person, Activity**, and **Organization** because these should have a **Place** (or several) with an **Address**.
+
+|Resource|Person|Activity|Org. |place |address|ConServ.|Event|Idea|
+|:-------|:----:|:------:|:---:|:---:|:-----:|:------:|:-----:|:-----:|
+|Person  |PP|PA|PO|Pp|- |PC|PE|PI|
+|Activity|- |AA|AO|Ap|- |AC|AE|AI|
+|Org.    |- |- |OO|Op|Oa|OC|OE|OI|
+|place   |- |- |- |pp|pa|pC|- |pI|
+|address |- |- |- |- |- |- |- |- |
+|ConServ.|- |- |- |- |- |- |- |- | 
+|Event   |- |- |- |- |- |- |EE|EI|
+|Idea |- |- |- |- |- |- |- |- |II|
+
+
+This leaves out **WorkGroup**, to be added via RoundTable because (a) security features, fields, and links (**isVisibleTo**) are invoked with **WorkGroup**, and (b) a **Workgroup** involve personal responsiblity that needs formal acceptance not haphazard imposition. Resources not yet included: **Conversation, Entry, Item, and Request.** 
+
+Some Resources are non-strict hierarchies, such as 
+
+>(**:Place**{label:"Departure Bay"}) -[**:hasPlace**]->  
+(**:Place**{label:"Strait of Georgia"}) -[**:hasPlace**]->  
+(**:Place**{label:"Pacific Ocean"}) 
+
+Thus "Departure Bay" should not be directly linked "British Columbia" although nothing prevents that. "Departure Bay" could also have links such as  
+-[**:hasIdea**]-**(:Idea**{name:"British Columbia"}).  
+That is, a (**:Place**) may be similar to an (:**Idea** {type:"political"}), and there is no technical problem about using the same name in two different Resources. On the other hand "Pacific" is ambiguous so better as (:**Place**{label:"Pacific Ocean"}) or (:**Organization**{label:"Pacific Region"}).
+
+#Conventions
+## Style
+RoundTable has many conventions, e.g. how names are capitalized. My preference is to follow the convention in Cypher language:  
+* Resources in CamelCase and bold: **Person, Place, Activity**,. 
+* Field names in pythonCase and italic: _label, description, startDate, nameString_,.  
+* The database convention of avoiding plural.  
+Some details are as yet unresolved: _familyname_ should be _familyName_.
+
+The style for RoundTable is Resources and Links are typically pythonCase: person, isRelatedTo; but mixed with conventional naming: webpage, hasWebpage (rather than webPage and hasWebPage). There are also variables with underscores: start_date, end_date.
+
+## Code for Node
+A nodes (Resource) is identified by 3 numeric codes (resource, type, ID) rather than by English words. This is enables localization:  one numeric code translate into names in many languages. It also allow synonyms, the same node by different names within one language.
+
+from roundtable_domain.js received 2018-05-07
+>var resourceNodeTypeID_domain = 11199;  
+var resourceNodeTypeID_person = 11210;  
+11210 person, 11211 organization, 11212 workgroup, 11213 event,11214 activity, 11215 place, 11216 document, 11217 webpage, 11218 citation, 11219 media, 11220 map, 11221 dataset, 11222 model, 11223 address, 11224 contactService, 11225 entry, 11226 item, 11227 request, 11228 message, 11229 conversation, 11230 learningObject, 11231 metadata, **11232 site**, 11233 other
+
+I added code 11234 for **Idea**. Rationale: Idea (aka IdeaTag, aka Tag) is just another Resource, just another node. The link between a "thing resource" and an "idea resource", or between two ideas, is not different than a link between two "thing resources".  
+2018-08-19. I discover this is obsolete, the code for deprecated "site" was deleted but that changed the code for "other" to be 11232 (which could also disappear). So now "Idea" has code 11233.
+
+## Code for Edge
+Edges are specified internally by 9 numeric codes: from, from type, from ID, link, link type, link ID, to, to type, to ID. These are numeric (integer) fields in link.  Note that unique id for edge is superfluous given two unique id for node. Further, from ID allows finding from and from type, as does to ID. This suggests 4 codes define an edge.  
+
+## Find code from name
+Codes for node, link, node type, and link type are in same .csv file: RTcodes.csv. The following chunk uses that file for a function that translates names to codes: RTcode(). When a code for type is required, the name of the node or link must accompany the type. This forced redundancy is for quality assurance.
+
+```{r RTcode}
+rtCode= read.csv("../data/RTcodes.csv")
+colnames(rtCode)   # what  name  code  typeName  typeCode  comment
+unique(rtCode[,1]) # resourceType  resource  linkType   link
+rtCode[c(1,72,129,150),1:5] 
+#             what              name  code  typeName  typeCode  
+# 1   resourceType          activity 11214      Blog     40004
+# 72      resource           dataset 11221                  NA
+# 129     linkType       isRelatedTo 21243   hasPeer     43008
+# 150         link hasContactService 21215                  NA 
+
+RTcode <- function(txt, what="resource", type="", a=rtCode){
+# Intolerant. stops if txt and type are not matched.
+# colnames(a)   # what  name  code  typeName  typeCode  comment
+# unique(a[,1]) # resourceType  resource  linkType   link
+    if(type == ""){
+    j <- (a[,1] == what)  & (a[,2] == txt);  # search. slow!
+    m <- a[j,3]        # match
+    if (length(m) ==0) stop("*** Error *** \n    No code for: ", txt," ", what, "\n")
+    res= c(as.integer(m),0L) # what, type.
+    return(res)
+  }
+# with subtype
+    whatType = paste0(what,"Type") # linkType, or resourceType
+    j <- (a[,1] == whatType) &  (a[,4] == type) # search.
+    t <- a[j,5]    # match type
+    if (length(t) == 0) stop("*** Error *** \n    No code for: ",
+                            txt," ", what," ", type, "\n");
+    res <- as.integer(c(a[j,3],t));
+    return(res)  # what, type
+}   
+
+txt <- "organization"; cat(txt,       RTcode(txt),"\n");
+txt1 <-"university";   cat(txt, txt1, RTcode(txt,"resource",txt1),"\n");
+txt <-  "isRelatedTo"; cat(txt,       RTcode(txt,"link"),"\n");
+txt1 <- "worksWith";   cat(txt, txt1, RTcode(txt,"link",txt1),"\n");
+txt1 <- "hasColleague";cat(txt, txt1, RTcode(txt,"link",txt1),"\n");
+# next 3 fail
+txt1 <- "worksFor";    cat(txt, txt1, RTcode(txt,"link",txt1),"\n"); # FAIL
+txt <- "dog";          cat(txt,       RTcode(txt),"\n"); # FAIL
+                       cat(txt,       RTcode(txt,"link"),"\n"); # FAIL
+```    
+
+This allows translating the understandable labels (names) in 
+*Scott Akenhead -hasPlace- Building:Pacific Biological Station*  
+into numeric codes, in this case:  
+> ({ResourceTypeID:11210, ResourceSubTypeID:0, ID:320})  
+    -[{ResourceLinkTypeID:21238}]->  
+ ({ResourceTypeID:21238,ResourceSubTypeID:411105, ID:27172 })
+
+## Sequential ID
+A unique identity field named _ID_ (uiid: unique instance id) is added to every instance of node and link. This can be approached as:  
+1. random numbers. Say a 16 byte field which is $2^{(16*4)} = 1.8\times 10^{19}$ so on the order of $10^{-12}$ chance of a duplicate when creating $10^7$ nodes and links. [not 100% sure]  
+2. sequential uiid. This means the last uiid must be known at all times.  
+3. unique field names (especially _label_) or combinations known to be unique: email, name + personal phone, latitude + longitude,. In fact, batch loading data for RoundTable requires unique labels, at least with batches.
+
+I used method #2 in what follows, incrementing a variable called *lastUID* that is the last (at time of use) of the sequential IDs, applied across all nodes. Please be careful with this variable.
+
+```{r lastUID}
+lastUID = 0  # Now see what you've done! What did I just say?
+```
+
+*lastUID* is incremented and applied to a dataframe by local function *AddUID()* with code such as `a %<>% AddUID;`  or `a <- AddUID(a);`.
+
+# Read Data Extracted from Survey
+Some .csv files were edited as Google sheets. Two files have edits that extend what was created from the Google sheets: Activity has Idea has Idea, Person has Person.
+```{r assign}
+cat("working directory:",getwd(),"\n") # "/Users/Scott/Documents/Projects/SalmoSphere/R"
+# Note the R "working directory" is not the "project directory."
+fs <- list.files("../output") # %T>% print # 18 files
+for (f in fs){
+    cat("\n",f)
+    obj <- f %>% strsplit(".", fixed=T) %>% unlist %>% `[`(1) # "Activity.csv" becomes "Activity"
+    f.in = paste0("../output/",f)   #    obj,".csv")
+    if (!file.exists(f.in)) stop(" file does not exist")
+    a <- read.csv(f.in); 
+    cat("  ", dim(a), "\n  "); cat(colnames(a),"\n")
+    assign(obj,a); # in parent environment
+}
+rm("f","fs","f.in","obj","a");
+```
+
+## Tidying
+```{r tidying}
+# remove Conley Kevin (a duplicate of Kevin Conley)
+#j <- which(PersonHasContactService$Person.name == "Conley Kevin")
+#PersonHasContactService <- PersonHasContactService[-j,]
+#Person <- Person[-j,]
+#rm("ActivityHasIdeaTag_pre-edit")
+```
+
+# Nodes
+A template is the basis for a generic Resource (node). Each node has nine basic fields: *resourceNodeTypeID, resourceNodeSubTypeID, ID, label, name, description, status, start_date,* and *end_date*.  3 are numeric, 4 are text, 2 are dates treated as text ("2018-08-04").
+```{r nodeTemplate}
+basicField <- c("resourceNodeTypeID", "resourceNodeSubTypeID", "ID",
+    "label","name","description",
+    "status","start_date","end_date");
+nodeTemplate=data.frame(t(c(1,1,1,"","","","active","2000-01-01","2099-12-31")))
+colnames(nodeTemplate) <- basicField;
+t(nodeTemplate)
+```
+
+## Person
+from RoundTable-Neo4j-SalmoSphere.net trials 2018 May 1
+rearranged: base fields first  
+
+> '{"resourceNodeTypeID":'+resourceNodeTypeID_person+', "resourceNodeSubTypeID": "", "ID":367,  
+"label":"Aaron Burgoyne", "name":"", "description":"",  
+"status":"active", "start_date":"2017 January 24","end_date":"",  
+"nameString":"Aaron Burgoyne", "first_name":"Aaron", "last_name":"Burgoyne"}'
+
+No "type" for **(:Person)** so _resourceNodeSubTypeID_ is 0.
+
+3 special fields: _nameString, first_name, last_name_ (inconsistent format). Other fields such as honorific and suffixes will can be parsed from nameString.
+
+```{r Person}
+# (0) the data
+    "Person" %>% ColNames
+# (1) set up data.frame with base and special field as column names
+    specialField <-c("nameString","first_name","last_name");
+    PersonRT <- AddSpecialField() # default: nodeTemplate, specialField
+# (2) values for those fields.
+    n <- dim(Person)[1];
+    PersonRT[1:n ,] <- list(
+        ResourceID("person"),0,0,
+        Person$Person.name, "", "",
+        "active","2017-01-24","",      # 9 base
+        Person$Person.name,       # nameString
+        Person$Person.firstName,  # first_name
+        Person$Person.lastName);  # last_name
+# (3) add unique ID
+    PersonRT %<>% AddUID;
+# (4) Cypher from this data.frame
+    queryPerson <- QueryCreateNode("person", PersonRT)
+```
+
+## Idea
+The data in IdeaTagA is name (325 of) and description (27 of) from keywords proffered survey respondents. Needs hand editing because of duplicates and synonyms: smolt, smolts, Smolt, Smolts.  That requires changing the names PersonHasIdeaTag to match.
+
+There are no special fields for **Idea**, just the 9 basic fields.
+Typically there will be a URL to explain an **Idea**, frequently Wikipedia:
+
+> (:Idea)-[hasWebPage{type:"source"}]-(:WebPage) 
+
+DeDuplicate() removes duplicate names, but appends any description in the repeated name(s) to the description of the first name. 
+
+### Idea subTypes
+
+> 67000 taxonomy, 67001 life_history, 67002 research,67003 management, 67004 administration, 67005 geography, 67006 ecology, 67007 biology, 67008 other, 67009 structure, 67010 function, 67011 IYS Theme
+
+### Three sets of Idea nodes
+IdeaTagA is from Activity keywords, this will be *IdeaRT*, and matches with *ActivityHasIdea*. The data in IdeaTagA is name (325 of) and description (27 of) from keywords proffered survey respondents. Needs hand editing because of duplicates and synonyms: smolt, smolts, Smolt, Smolts.  That requires changing the names in PersonHasIdeaTag to match.
+
+```{r idea1}
+ColNames("IdeaTagA");
+d <- DeDuplicate(IdeaTagA) # col1:name, col2:description.
+n=dim(d)[1]; cat(n,"surviving records.\n"); # n <- 4
+IdeaRT<- nodeTemplate;
+IdeaRT[1:n ,] <- list(
+    ResourceID("idea"),NA,NA,
+    d[,1], "", d[,2],
+    "active", "2017-01-24", "");
+IdeaRT %<>% AddUID;
+queryIdea <- QueryCreateNode("idea", IdeaRT)
+```
+
+
+A second set of data is PersonHasIdeaTagB, with 67 unique labels and 70 rows.  Only 3 names are used more than once: "stewardship groups", WSP", "by-catch." Several names vary only as plural or not. 
+These are key phrases that people used to describe themselves. This will be *IdeaRT2*:
+```{r idea2}
+ColNames("PersonHasIdeaTagB")
+d <- PersonHasIdeaTagB[,2:3]; # col1:name, col2:description (any names)
+d <- DeDuplicate(d)
+n=dim(d)[1]; cat(n,"surviving records.\n")
+Idea2RT<- nodeTemplate;
+Idea2RT[1:n,] <- list(
+    ResourceID("idea"),NA,NA,
+   d[,1], "", d[,2],
+   "active","2017-01-24","");
+Idea2RT %<>% AddUID;
+queryIdea2 <- QueryCreateNode("idea", Idea2RT)
+```
+
+The third set of ideas involves PersonhasIdeaTag with 3,551 rows related to the 43 IYS topics. Those will be IdeaRT3 from IdeaTag with 43 rows. 
+```{r idea3}
+ColNames("IdeaTag")
+d <- IdeaTag; # col1:name, col2:description (any names)
+n=dim(d)[1]; cat(n,"records.\n")
+Idea3RT<- nodeTemplate;
+Idea3RT[1:n,] <- list(
+    ResourceID("idea"),NA,NA,
+   d[,1], "", d[,2],
+   "active","2017-01-24","");
+Idea3RT %<>% AddUID;
+queryIdea3 <- QueryCreateNode("idea", Idea3RT)
+```
+
+
+## ContactService
+received 2018-05-09:
+> var obj_contactServices = {"contactServices": [{ 
+"ID": 618, "resourceNodeTypeID":11224, 
+"resourceNodeSubTypeID": 420000,  
+"label": "Aaron Burgoyne", "name": "Aaron Burgoyne",  "description": "", "start_date": "", "end_date": "", "status": "active" "contactServiceString": "Aaron.Burgoyne@dfo-mpo.gc.ca"},
+
+special field:  _contactServiceString_ for the URLs, phone numbers, and emails. This can decoded, e.g. extract a phone number with a country code, city code, and number, or extract a valid URL. 
+
+Plan B is a list of common and explicit contact services: emailWork, emailHome, phoneWork, phoneGeneral, phoneHome. Connecting via social media websites (twitter) and by collaboration websites (slack, roundtable).  
+
+The label (actually, the _name_) for **ContactService** can be a **Person Organization, or Event**.  
+
+The edge type for  
+> (:Person)-[hasContactService{type='email'}]->(:ContactService)  
+
+would be the same as the **ContactService type**. Tighter in some future version of RoundTable.
+
+Are more types of ContactService are required? How about:  
+code  typeName
+----------------
+1 emailWork
+2 emailPersonal
+3 phoneWork
+4 phonePersonal
+5 phoneOther
+6 socialMedia - no need for individual subtypes, covered in Label and Description, the latter containing the URL, etc.
+7 collaboration - for work, e.g. Slack, GitHub,. see 6. 
+
+```{r ContactService}
+ColNames("PersonHasContactService");
+d <-     PersonHasContactService
+d[is.na(d$phoneWork),"phoneWork"] <-"" # make NA into empty
+n <- dim(d)[1]; # cat(n,"records.\n");
+specialField <- c("contactServiceString")
+ContactServiceRT <- AddSpecialField() # used default names
+ContactServiceRT[1:n,] <- list(
+    ResourceID("contactService"),NA,NA,
+    d$Person.name, d$Person.name, "",
+    "active","2017-01-24","",
+    paste(d$emailWork,d$phoneWork) );
+ContactServiceRT %<>% AddUID; 
+queryContactService <- QueryCreateNode("contactService",ContactServiceRT)
+```
+
+## Activity
+From roundtable_data.js:
+>var activities_text = '{"activities": ['+'{"ID": 24011,"label": "International", "name": "International", "description_long": "An intensive burst", "activityType": "program", "status": "active", "startdate": "dfadfa", "enddate": "fdafdadf" },'+
+
+Reconciling these names with basic names: description_long is description, activityType is resourceNodeSubTypeID.  
+No special fields.
+
+```{r Activity}
+ColNames("Activity")
+n=dim(Activity)[1]; # cat(n,"records. \n")
+ActivityRT<- nodeTemplate;
+ActivityRT[1:n,] <- list(
+    ResourceID("activity"),NA,NA,
+    Activity$Activity.name,"",
+    Activity$Activity.description,
+    "active","2017-01-24","");
+ActivityRT %<>% AddUID;
+queryActivity <- QueryCreateNode("activity", ActivityRT)
+```
+
+
+## Organization
+field for description is missing from RT  
+organizationtype should be organizationType  
+From roundtable_data.js:  
+
+> var organizations_text = '{"organizations": ['+'{"ID": 3901, "label":"Institute of Ocean Sciences", "name": "Institute of Ocean Sciences", "acronym":"IOS", "organizationtype": "federal research", "status":"active", "startdate":"2017 January 24", "enddate":"2017 January 26"},'+
+
+special names: acronym.  
+_PBS_ is initials and not an pronouncable acronym. _WHOI_ is an acronym.  
+note: we have OrgHasOrg[,"fromOrg.name"]" but let's start with PersonHasOrg. This has 367 records with 121 unique labels. There were no descriptions; future data with descriptions will need DeDuplicate() as per **Idea** above.  
+
+```{r Org}
+ColNames("PersonHasOrg")
+d <- unique(PersonHasOrg$Org.name) # vector not data.frame
+n=length(d);  cat(n,"surviving records. \n") 
+specialField=c("acronym")
+OrganizationRT  <- AddSpecialField() # used default names
+OrganizationRT [1:n,] <- list(
+    ResourceID("organization"),NA,NA,
+    d[1:n], "", "",
+    "active","2017-01-24","",
+    "");
+OrganizationRT  %<>% AddUID;
+queryOrganization <- QueryCreateNode("organization", OrganizationRT )
+```
+
+## WebPage
+From roundtable_data.js:  
+
+>var webpages_text = '{"webpages": ['+'{"ID": 21101,"label": "PBS Home Page", "name": "Pacific Biological Station Home Page",  "description": "main webpage for the Pacific Biological Station", "URL":"http://www.pac.dfo-mpo.gc.ca/science/facilities-installations/pbs-sbp/index-eng.html", "status": "active","webpagetype": "main", "createdDate": "2017 January 19", "modifiedDate": "2017 January 19" }'+
+
+_webPageType_ is taken to be a type of WebPage. An important role for _hasWebPage_ is to declare the source of information, so "source" should be a type (ditto for that edge).
+"Wikipedia" should be such a type because of its ubiquitous use.  
+Note resource name in RT is not CamelCase or pythonCase: webpage.
+
+Special fields: URL, modifiedDate. 
+
+How does one determine _modifiedDate_ for a web page? This is a famous gap in the definition of the WWW. This should probably be _accessedDate_ which is frequently used when citing a URL as the source of information. Typically the user is not the person who modified that URL.
+
+The survey data has multiple URLs in a list. That was dealt with in previous "Survey as Sheets into R.Rmd" 
+
+Using data from my ActivityHasWebPage.csv file; that has an error:  
+column name _IdeaTag.name_ should be _URL_.
+
+```{r WebPage}
+ColNames("ActivityHasWebPage")
+d <- ActivityHasWebPage; 
+colnames(d)<-c("name","URL") # rename for convenience
+n=dim(d)[1];
+specialField=c("URL","accessedDate")
+WebPageRT  <- AddSpecialField() # used default names
+WebPageRT [1:n,] <- list(
+    ResourceID("webpage"),NA,NA,
+    d$name, "", "",
+    "active","2017-01-24","",
+    d$URL,"");
+WebPageRT  %<>% AddUID;
+queryWebPage <- QueryCreateNode("webpage", WebPageRT );
+```
+
+Also URLs for description of Place in AddressHasPlace.
+```{r WebPage2}
+ColNames("PlaceHasAddress")
+d <- PlaceHasAddress[c("place","webPage")]
+d <- d[!is.na(d[,"webPage"]), ]
+n=dim(d)[1];
+specialField=c("URL","accessedDate")
+WebPage2RT  <- AddSpecialField() # used default names
+WebPage2RT [1:n,] <- list(
+    ResourceID("webpage"),NA,NA,
+    d$place, "", "",
+    "active","2017-01-24","",
+    d$webPage,"");
+WebPage2RT  %<>% AddUID;
+queryWebPage2 <- QueryCreateNode("webpage", WebPage2RT );
+```
+
+## WorkGroup
+From roundtable_data.js 2018-04-13
+>'{"ID": 21001,"resourceNodeTypeID":'+resourceNodeTypeID_workgroup+',"resourceNodeSubTypeID": "'+resourceNodeSubTypeID_network+'", "label": "DFO Salmon Network", "name": "DFO Salmon Network",  "description": "salmon staff in DFO", "status": "active", "startdate": "2017 January 19", "enddate": "2020 January 19"},'+
+
+spelling: 'workgroups' but used as 'workgroup' and should be workGroup or better WorkGroup.  
+_workgrouptype_ is taken to be subType.
+
+no special fields
+
+There is no survey data for WorkGroup, so for testing and development I used:  
+“We, the unwilling, led by the unknowing, are doing the impossible for the ungrateful. We have done so much, for so long, with so little, [that] we are now qualified to do anything with nothing.” ― Konstantin Jireček  
+
+```{r WorkGroup}
+d <- c("We the Unwilling", "Led by the Unknowing", "Doing the Impossible","For the Ungrateful") 
+# n=dim(d)[1]; 
+n=4; cat(n,"records.\n") 
+WorkGroupRT  <- nodeTemplate
+WorkGroupRT[1:n,] <- list(
+    ResourceID("workgroup"),NA,NA,
+    d, "", "",
+    "active","2017-01-24","");
+WorkGroupRT  %<>% AddUID;
+queryWorkGroup <- QueryCreateNode("workgroup", WorkGroupRT )
+
+```
+
+## Place 
+> var places_text = '{"places": ['+'{ "ID": 27000,"label": "Canada","name": "Canada","abbreviation":"","alpha2code":"CA", "alpha3code":"CAN", "numeric":"124","description": "","placetype": ,"altPlaceType":"","status": "active","geoJSONStringType": "Polygon", 	"geoJSONString": "", "source":"", "sourceurl":"" },'+
+
+From roundtable_data.js 2018-04-13
+>var places_text = '{"places": ['+ '{
+"ID": ,"resourceNodeTypeID":,"resourceNodeSubTypeID":,  "label": ,   "name": , "abbreviation":, "alpha2code":, "alpha3code":, "numeric":,"description": "",    "altPlaceType":"", "status": , "geoJSONStringType": , "geoJSONString": "", "source":"", "sourceurl":
+
+9 special names: abbreviation, alpha2code, alpha3code, numeric, altPlaceType, geoJSONStringType, geoJSONString, source, sourceurl
+
+_placetype_ is redundant with type for *Place*. sourceurl should be _sourceURL_. _source_ and _sourceurl_ look like they should be replaced by: 
+> ()-[hasWebPage{subType:"source"}]->(:WebPage)
+
+```{r Place}
+ColNames("PlaceHasAddress")
+n=dim(PlaceHasAddress)[1];
+specialField=c("abbreviation", "alpha2code", "alpha3code", "numeric","altPlaceType", "geoJSONStringType", "geoJSONString", "source", "sourceurl") # 9
+PlaceRT  <- AddSpecialField()
+PlaceRT[1:n,] <- list(
+    ResourceID("place"),NA,NA,
+    PlaceHasAddress$place, "", "",
+    "active","2017-01-24","",
+    "","","","","","",PlaceHasAddress$latLong,"",
+    PlaceHasAddress$webPage); # 9 base 9 special
+PlaceRT  %<>% AddUID;
+queryPlace <- QueryCreateNode("place", PlaceRT )
+```
+
+## Address
+> var addresses_text = '{"addresses": ['+'{
+"ID": 29001,"label": "NAFC","name": "Northwest Atlantic Fisheries Centre ", "addressString": "80 East White Hills Road  St. John\'s, NL Canada A1A 5J7", "addressTypeID": 41000,"status": "active", "street": "80 East White Hills Road ","locality": 27014,"region": 27001, "country": 27000,"postalCode": "A1A 5J7", "geoJSONStringType":"point", "geoJSONString":"[longitude, latitude, elevation]" },'+ 
+
+Should be address not addresses. addressTypeID is subType in other resources. 
+Missing the basic field: description.
+
+BUT fixed as of 2018-03-13
+>var current_address_addressType ="";
+var current_address_addressString= "";
+var current_address_label ="";
+var current_address_name ="";
+var current_address_description ="";
+var current_address_postOfficeBox ="";
+var current_address_aptNumber ="";
+var current_address_street= "";
+var current_address_locality ="";
+var current_address_region ="";
+var current_address_country ="";
+var current_address_postalCode ="";
+var current_address_geoJSONStringType ="";
+var current_address_geoJSONString ="";
+var current_address_status ="";
+var current_address_startDate ="";
+var current_address_endDate ="";
+
+"The addressString is parsed into its various parts if the user wants it. Just give the street  address as a string and there are routines to  parse it.  (Do need to pick out locality, region and country).  And these parse results can be edited by the user." JSC
+
+Why "current" address given _status, startdate, enddate_?
+
+Region means "state or province". Locale means "city or town".  
+There will be pre-assigned numeric codes for Place that can be used within Address: country, province, addressTypeID,. These are separate (?) from the unique IDs assigned to Place nodes at this stage.
+
+GIS data could (should) be a separate Resource that is easily used in MapView. Now GIS data is scattered across at least three Resources: place, address, dataset.  Typically latitude precedes longitude.  
+Update, 2018 August 2: GIS data removed from **Address**. Kept in **Place**.
+r
+DFO Region is *Organization* and *Place*; redundant is OK. But not *Idea* and not *Address*.
+
+Eight special fields: addressString, postOfficeBox, aptNumber, street, locality, region, country, postalCode.  
+Dropped: geoJSONStringType, geoJSONString.
+
+```{r Address}
+ColNames("PlaceHasAddress")
+n=dim(PlaceHasAddress)[1];
+specialField=c("addressString", "postOfficeBox", "aptNumber", "street", "locality", "region", "country", "postalCode") # 8
+# dropped "geoJSONStringType", "geoJSONString",
+AddressRT  <- AddSpecialField()
+PlaceHasAddress$poBox[is.na(PlaceHasAddress$poBox)] <- "";# not "NA"
+string <- with( PlaceHasAddress[1:n,], paste(sep=",",
+    poBox,"", address, city, province,"Canada", postalCode));
+AddressRT[1:n,] <- list(
+    ResourceID("address"),NA,NA,
+    PlaceHasAddress$place, "", "",
+    "active","2017-01-24","",
+    string, PlaceHasAddress$poBox, "", PlaceHasAddress$address, 
+    PlaceHasAddress$city, PlaceHasAddress$province, "Canada",
+    PlaceHasAddress$postalCode); # 9 base 8 special
+AddressRT %<>% AddUID;
+queryAddress <- QueryCreateNode("address", AddressRT)
+```
+
+## Event
+> var events_text = '{"events": ['+'{"ID": 25001, "label": "DFO IYS Workshop Richmond January 2017", "name": "DFO IYS Workshop Richmond January 2017", "description": "DFO salmon scientists network","eventtype": "workshop","status": "active","startdate": "2017 January 24", "enddate": "2017 January 26"},'+	
+
+no special fields. few event types with codes. workshop:411125; need Event types:meeting, conference,,  yet.
+
+```{r Event}
+d=data.frame(label=c("DFO IYS Workshop Richmond January 2017","State of Salmon Workshop Planning"), description=c("DFO salmon scientists network","Activity Tables, Information Sharing Technologies, and Funding Opportunities"), 
+    type=c(411125,411125), 
+    startDate=c("2017 January 24","2017-7-10T0930/1030"), 
+    endDate=c("2017 January 26","2017-7-10"))
+n=dim(d)[1]; cat(n,"records. \n");
+EventRT <- nodeTemplate; # no special fields
+EventRT[1:n,] <- list(
+    ResourceID("event"), d$type, NA,
+    d$label,"", d$description,
+    "active","2017-01-24","");
+EventRT %<>% AddUID; 
+queryEvent <- QueryCreateNode("event", EventRT)
+```
+
+## Map
+> var maps_text = '{"maps": ['+'{"ID": 1121307,"size": 20,"x": 6,"y": 109,"type": "map","label": "map label 2","name": "map name 2","maptype": "","status": "active","source": "Salish Sea Wiki","sourceurl": "http://salishseatrust.ca"}'+
+
+Should be map not maps. _mapType_ is type, but no table for Map types and codes. Fields for map: x,y (without units) should be in CSS for detail pages. 
+specialField=c("source", "sourceURL")
+
+```{r Map}
+d=data.frame(
+label=c("Pacific Salmon Conservation Assessment","Salish Sea (East up)"),
+description=c("This 2010 map shows the south to north march of salmon decline, with the blue watersheds remaining as the strongest – full of abundant salmon with diverse life histories, and least affected by hatcheries.",
+"The SALISH SEA extends from the north end of the Strait of Georgia and Desolation Sound to the south end of the Puget Sound and west to the mouth of the Strait of Juan de Fuca. For this map North is to the left rather than at the top of the map."),
+x=c("Wild Salmon Centre",
+  "Stephan Frelan, Western Washington University, 1-360-650-2949, stefan@wwu.edu"), URL=c("wildsalmoncenter.org/resources/atlas-pacific-salmon",
+"staff.wwu.edu/~stefan/maps/Freelan_SalishSea_Landscape.jpg") )
+n=dim(d)[1]; cat(n,"records\n")
+specialField=c("source", "sourceURL")
+MapRT <- AddSpecialField()
+MapRT[1:n,] <- list(
+    ResourceID("map"), NA, NA,
+    d$label,"", d$description,
+    "active","2017-01-24","",
+    d$x, d$URL);
+MapRT %<>% AddUID;
+queryMap <- QueryCreateNode("map", MapRT);
+```
+
+## Doc
+>var documents_text = '{"documents": ['+'{ 
+"ID": 22001, 	
+"label":"A Departmental Salmon Network", 
+"name": "A Departmental Salmon Network with Reference to the International Year of the Salmon", 
+"description": "Draft Terms of Reference",
+"format": ".docx",
+"citation_string": "2017 January 19", 
+"createdDate":"E JAN 01 2017", 
+"modifiedDate":"E FEB 28 2017"},'+
+
+Does RoundTable follow ISO6801 for dates? It should. Else assumption that all date formats, including mistakes, can be automatically recognized and translated. 
+
+This node describes and _locates_ (how?) a document, and should allow immediate retrieval via some link to internal or external file.  Content for the **Citation** resource should not be duplicated in **Document**, ideally there is _hasCitation_.  Guessing that _citation_string_ is the equivalent of "this document is correctly cited as ..."
+
+specialField=c("createdDate","modifiedDate","format","citation_string") 
+
+```{r Document}
+d=data.frame(
+    label="A Departmental Salmon Network", 
+    name="A Departmental Salmon Network with Reference to the International Year of the Salmon", 
+    description="Draft Terms of Reference",
+    format=".docx",
+    citation_string="2017 January 19", 
+    createdDate=    "2017-01-27", 
+    modifiedDate="2017-01-28") 
+n=dim(d)[1]; cat(n,"records. \n")
+specialField=c("createdDate","modifiedDate","format","citation_string") 
+DocumentRT <- AddSpecialField();
+DocumentRT[1:n,] <- list(
+    ResourceID("document"), NA, NA,
+    d$label,d$name, d$description,
+    "active","2017-01-24","",
+    d$createdDate,d$modifiedDate,d$format,d$citation_string);
+DocumentRT %<>% AddUID; 
+queryDocument <- QueryCreateNode("document", DocumentRT)
+```
+
+
+## Citation
+
+Should this be standardized on BibTex? All other citation formats are, I think, derivable (but not our problem to recast).
+
+format="BibTex",  
+citation_string="@article{Akenhead:2016aa, Author = {Scott A. Akenhead and James R. Irvine and Kim D. Hyatt and Stewart C. Johnson and Catherine G.J. Michielsens and Sue C.H. Grant},Date-Added = {2018-02-24 23:07:46 +0000},Date-Modified = {2018-02-24 23:58:02 +0000},Journal = {North Pacific Anadromous Fish Commission Bulletin},Keywords = {Fraser River, sockeye salmon, stock-recruit, variance factor, Chilko Lake, spawning channel},Number = {6},Pages = {391:414},Rating = {5},Read = {1},Rss-Description = {doi:10.23849/npafcb6/391.414},Title = {Habitat Manipulations Confound the Interpretation of Sockeye Salmon Recruitment Patterns at Chilko Lake, British Columbia},Year = {2016}}"); 
+
+```{r Citation}
+d=data.frame(
+    label="Akenhead:2016aa", 
+    name="Habitat Manipulations Confound the Interpretation of Sockeye Salmon Recruitment Patterns at Chilko Lake, British Columbia", 
+    description="",
+    format="BibTex",
+    citation_string="@article{Akenhead:2016aa, Author = {Scott A. Akenhead and James R. Irvine and Kim D. Hyatt and Stewart C. Johnson and Catherine G.J. Michielsens and Sue C.H. Grant},Date-Added = {2018-02-24 23:07:46 +0000},Date-Modified = {2018-02-24 23:58:02 +0000},Journal = {North Pacific Anadromous Fish Commission Bulletin},Keywords = {Fraser River, sockeye salmon, stock-recruit, variance factor, Chilko Lake, spawning channel},Number = {6},Pages = {391:414},Rating = {5},Read = {1},Rss-Description = {doi:10.23849/npafcb6/391.414},Title = {Habitat Manipulations Confound the Interpretation of Sockeye Salmon Recruitment Patterns at Chilko Lake, British Columbia},Year = {2016}}", 
+    createdDate= "2018-02-24 23:07:46 +0000", 
+    modifiedDate="2018-02-24 23:58:02 +0000") 
+n=dim(d)[1]; cat(n,"records. \n")
+specialField=c("createdDate","modifiedDate","format","citation_string") 
+CitationRT <- AddSpecialField();
+CitationRT[1:n,] <- list(
+    ResourceID("citation"), NA, NA,
+    d$label,d$name, d$description,
+    "active","2017-01-24","",
+    d$createdDate,d$modifiedDate,d$format,d$citation_string);
+CitationRT %<>% AddUID; cat("lastUID =",lastUID,"\n");
+queryCitation <- QueryCreateNode("citation", CitationRT);
+```
+
+## MetaData
+>var metadata_text = '{"metadata": ['+'{"ID": 23601,"label": "label for metadata 1", "title": "title of metadata 1", "description":"description for metadata 1", "metadataStandardID":411100, "metadataString": "hlkhlkafhsl", "status":"active",  "createdDate":"E JAN 01 2017", "modifiedDate":"E FEB 28 2017"},
+
+Corrected _title_ to be _name_.  Seems to be about formal provenance of datasets, as opposed to "What you need to know before you analyze this data." But maybe caveats and advice would be better in a **Document.**
+
+specialField=c("createdDate","modifiedDate","metadataStandardID","metadataString")
+
+```{r MetaData}
+d=data.frame(
+    label="MetaData Label One", 
+    name="MetaData Name One", 
+    description="What you need to know before you analyze this data.",
+    metadataStandardID=411100, metadataString="hlkhlkafhsl",
+    createdDate= "2018-02-24T23:07:46+0000", 
+    modifiedDate="2018-02-24T23:58:02+000") 
+n=dim(d)[1]; cat(n,"records. \n")
+specialField=c("createdDate","modifiedDate",
+               "metadataStandardID","metadataString")
+MetaDataRT  <- AddSpecialField();
+MetaDataRT[1:n,] <- list(
+    ResourceID("metadata"), NA, NA,
+    d$label, d$name, d$description,
+    "active","2018-02-24","",
+    d$createdDate,d$modifiedDate,d$metadataStandardID,d$metadataString);
+MetaDataRT %<>% AddUID; 
+queryMetaData <- QueryCreateNode("metadata", MetaDataRT)
+```
+
+
+``` ## Media
+>var media_text = '{"media": ['+'{"ID": 112001,"size": 20, "x": 6,"y": 2,"type": "media", "label": "media label 1","name": "media name 1", "mediaType": "text", "mediaSubType": "MSword","status": "active","source": "Salish Sea Wiki","sourceurl": "https://salishsearestoration.org/wiki/Workgroups"},'+
+
+mediaSubType, is that "format" -- as in .png?  
+"size" looks like it should be a list that includes x and y. Should size be hasMetaData-MetaData for that media, or is that part of all file formats for media? Is size in inches, cm, or pixels?. I threw all of this into _sizeString_.
+
+Is there a **Metadata** node for each media node, or is that optional? E.g. The history of a plot?
+
+We also need "createdDate" and "modifiedDate" here.  The ISO 6801 formate is 2018-12-31T23:59:59+0800 where the last bit is the time zone (hours after UTC).
+
+specialField=c("createdDate","modifiedDate","metadataSubType", "sizeString", source","sourceurl");
+
+```{r Media}
+d=data.frame(
+    label="Ontario Tourist Lands 83 Pound Spring", 
+    name="Huge BC Salmon Hooked By Tourist", 
+    description="As the above Vancouver Sun photo proves BC Waters still yield some monster salmon!",
+    createdDate= "2012-08-24", 
+    modifiedDate="",
+    mediaSubType=".jpg",
+    sizeString="size:20, x:5.56, y:3.58",
+    source="http://www.nanaimo-info-blog.com",
+    sourceurl="http://1.bp.blogspot.com/-rWl6JEPc718/UDe0e8Ta_KI/AAAAAAAAZvI/H8OnOGw1jAo/s400/Huge+Salmon.jpg");
+n=dim(d)[1]; cat(n,"records. \n")
+specialField=c("createdDate","modifiedDate","metadataSubType", "sizeString", "source","sourceurl");
+MediaRT  <- AddSpecialField();
+MediaRT[1:n,] <- list(
+    ResourceID("media"), NA, NA,
+    d$label[1:n],d$name[1:n], d$description[1:n],
+    "active","2018-02-24","",
+    d$mediaSubType, d$createdDate,d$modifiedDate, d$sizeString, d$source, d$sourceurl);
+MediaRT %<>% AddUID;
+queryMedia <- QueryCreateNode("media", MediaRT)
+```
+
+## Model 
+> var models_text = '{"models": ['+'{ "ID": 112132,"size": 20, "x": 6, "y": 109, "type": "model","label": "model label 2", "name": "model name 2", "modeltype": "", "status": "active","source": "Salish Sea Wiki", "sourceurl": "http://salishseatrust.ca" }'+']}';
+
+No design for Model object (yet). We'll go with something minimal.  
+specialField=c("createdDate","modifiedDate");
+
+```{r Model}
+d=data.frame(
+    label="Surveyinto Neo4j",
+    name="Load Neo4j Database from 2017 October Survey for DFO Salmon Network", 
+    description="The 2017 October survey of DFO salmon staff were previously edited and unpacked into .csv tables via R notebook *Survey as Sheets Into R.Rmd*. The objectives of this R notebook is a neo4j database for version 0.1 of RoundTable^tm^ on SalmoSphere.net.",
+    createdDate= "2018-08-6", 
+    modifiedDate="")
+
+n=dim(d)[1]; cat(n,"records. \n")
+specialField=c("createdDate","modifiedDate");
+ModelRT  <- AddSpecialField();
+ModelRT[1:n,] <- list(
+    ResourceID("model"), NA, NA,
+    d$label[1:n],d$name[1:n], d$description[1:n],
+    "active","2018-02-24","",
+    d$createdDate,d$modifiedDate);
+ModelRT %<>% AddUID;
+queryModel <- QueryCreateNode("model", ModelRT)
+```
+
+## Save Nodes as .Rdata
+```{r saveNodes}
+a <- ls(pattern="RT");  # list with names *RT
+j <- a %in% c("OldEdgeRT","EdgeRT", "RTcode");  # functions *RT and RT*
+a <- a[!j];  # delete
+save(list=a, file="../Nodes.Rdata");  # into SalmoSphere not SalmoSphere/R
+cat("saved", length(a),"objects to:\n"); file.info("../Nodes.Rdata")[c(1,4)];
+```
+
+
+## Export Nodes to CSV
+```{r NodesCSV}
+for( obj in a){
+    cat(obj,"  ")
+    #file=paste0("../output/",obj,".csv")
+    #write.csv(obj, file=file);  # into SalmoSphere/output
+}
+cat("\n",length(a),"objects saved as .csv files")
+```
+## Export Nodes to JSON
+```{r nodesJSON}
+node <- c("Activity","Address","Citation","ContactService","Document","Event","Idea","Idea2","Idea3","Map","Media","MetaData","Model","Organization","Person","Place","WebPage","WebPage2","WorkGroup"); 
+for(j in 1:length(node)){
+    cat(j,node[j],"  ")
+    p=paste0('../output/',node[j],'JSON.txt')
+    obj=get(paste0(node[j],'RT'))
+    write_json(obj,path=p,pretty=T)
+}
+```
+
+
+# Edges 
+An edge is node-link-node, as in (:X)-[:hasY]-(:Y).  Links are constrained to pre-specified types not always defined by the resources involved. Thus is an important aspect of RoundTable, so the better description of an edge is (:X)-[:Z]-(:Y).
+
+Four numeric codes are required for to identify an edge:
+1 for Link code, 1 for Link type code, 1 for _from_ Resource ID , and 1 for _to_ Resource ID.  As of 2018-08-26 there are 17 fields that enable "rich links", convenience, and possibly computing efficiency. For instances, there is no need to look up the name for resource and type from unique ID for resource in an edge, and the unique ID for a link allows it to be retrieved independently of the unique ID for associated nodes. The fields in a Link are similar to nine basic fields for Resources, with the addition of 6 numeric fields that identify the associated Resources, and with  _isPrimary_  and _language_ as named fields within the link.
+
+## RT Definition
+**Edge** as of 2018-08-25 email from JSC. Updated 2018-08-26.  
+
+>"fromResourceNodeTypeID":'+resourceNodeTypeID_person+’
+
+Here are the fields for RoundTable as of 2018-08-26:  
+  resourceLinkTypeID -            code for Edge
+  resourceLinkSubTypeID -         code for Edge type
+  ID -                            unique ID for this Edge (link) 
+  fromResourceNodeTypeID -        code for from Resource (node) 
+  fromResourceNodeSubTypeID -     code for from Resource type  
+  fromResourceNodeID  -           unique ID for from Resource
+  toResourceNodeTypeID -          code for to Resource  
+  toResourceNodeSubTypeID -       code for to Resource type  
+  toResourceNodeID -              unique ID for from node  
+  label -       short, hopefully unique name. label for GraphView.  
+  name -        long name, title for description, etc.  
+  description - will appear in DetailView.  
+  isPrimary -   when a "from" has >1 "to", such as:  
+      Org with >1 -[:hasPerson{type:"contact"}]-()  
+      Activity with >1 hasPlace.  
+  status -      link is "active" or historical or retired or ... 
+  start_date -  for the relationship. Nodes have their own start_date  
+  end_date -    when will link status change? (links retired not deleted?)  
+
+Numberic codes and unique ID arranged general to specific: Link _has_ type _has_ instance. 
+ 
+```{r linkFieldName}
+linkFieldName=c("resourceLinkTypeID", "resourceLinkSubTypeID" ,"ID",
+    "fromResourceNodeTypeID", "fromResourceNodeSubTypeID", "fromResourceNodeID",
+    "toResourceNodeTypeID", "toResourceNodeSubTypeID", "toResourceNodeID", 
+    "label", "name", "description", "isPrimary", "language", 
+    "status", "start_date", "end_date")
+cat("There are 9 numeric fields: \n",linkFieldName[1:3], "\n", linkFieldName[4:6], "\n", linkFieldName[7:9], "\nand 8 text fields: \n",linkFieldName[10:17],"\n")
+```
+
+**isRelatedTo** is used for all links between the same resource:  
+**X-[isRelated to]-X**  
+Many types within this edge are possible, as per javascript:  
+>"linkTypeID":'+resourceLinkTypeID_isRelatedTo+',  
+"linkSubTypeID":'+resourceLinkSubTypeID_worksWith+'
+
+
+Compliance with RoundTable javascript is paramount but notice that 5 of the 9 numeric fields are redundant. _fromResourceNodeTypeID_ and _fromResourceNodeSubTypeID_ are not required if we have _fromResourceNodeID_ that uniquely defines that node and allows identifying resource and type. Ditto "to." A unique ID for a link is redundant because [fromID, toID, linkSybTypeID] but if there is a frequent requirement to identify a link via unique ID, then efficiency prevails.
+
+Theoretically, there will be $n(n+1)/2 = 26(27)/2= 351$ types of edge, but most are trivial: **X-hasY-Y**. Not more than 15 types within links would seem like a design objective. In RoundTable, about 42 edges (X-has-Y) have been identified independently of the X and Y resources, thus **X-Z-Y**, with named links **Z* and types within those edges. Edges are defined by "semantic" links such as  _created_ and _createdBy_ instead of **Person-[hasDocument]-Document** or similarly **Event-[hasMedia]-** , **WorkGroup-[hasModel]-, Place-[hasMap]-**. Typically a named link is obvious from context:  
+>MATCH (:Person{ID:333})--(d:Document) RETURN d  
+MATCH (:Document{ID:555})--(p:Person) RETURN p
+
+Inconsistency of Link type and subType:  
+_hasManager_ - should be **-[:hasPerson{type:"Manager"}]->**  
+_hasOrganizationAffiliate_ - ditto
+_hasActivityParticipant_   - ditto
+_hasWorkgroupMember_       - ditto
+_hasEventRole_             - ditto
+
+_hasSeen_, _seenBy_, and _isVisibleTo_ are strictly internal to RT. (?)
+
+### Link Codes
+These are obtained with the function LinkID(). This function returns  NA is valuable in order to determine when the link name is incorrect. Examples:  
+> a <- LinkID("isRelatedTo"); a;  # 21243  
+a <- LinkID("has"); a;  # NA but see _isLinkedTo_ 
+
+
+```{r linkCode}
+a <- scan(what=c("a",1,"a"),strip.white=TRUE,text=
+"citedBy 21261 citation
+cites 21247 citation
+containedIn 21262 NA
+contains 21248 NA
+created 21231 NA
+createdBy 21260 NA 
+hasActivity 21227 Activity
+hasActivityParticipant 21267 Activity
+hasActivityRole 21257 Activity
+hasAddress 21219 Address 
+hasCitation 21218 Citation
+hasContactPerson 21259 Person
+hasContactService 21220 ContactService
+hasConversation 21236 Conversation
+hasDataset 21258 Dataset
+hasEntry 21237 Entry 
+hasEvent 21228 Event
+hasEventParticipant 21266 Event
+hasEventRole 21256 Event
+hasItem 21232 Item
+hasManager 21251 Person
+hasMedia 21229 NA
+hasMessage 21241 NA
+hasMetadata 21249 NA
+hasOrganization 21226 NA
+hasOrganizationAffiliate 21265 Organization
+hasOrganizationRole 21254 Person
+hasPlace 21238 NA
+hasRequest 21242 NA
+hasResponse 21250 NA
+hasSeen 21235 NA
+hasUser 21252 NA
+hasWebpage 21217 NA
+hasWorkgroup 21221 NA
+hasWorkgroupMember 21264 Person
+hasWorkgroupRole 21255 Person
+inAddress 21268 Place
+isLinkedTo 21245 NA
+isRelatedTo 21243 NA
+isVisibleTo 21210 NA
+seenBy 21263 NA
+selected 21253 NA
+hasIdea	21274 Idea");
+
+j=seq(1, length(a)-2, 3) # reconstruct columns. 126/3 -> 42 links
+linkCode=data.frame(link=a[j], code=as.numeric(a[j+1]), toNode=a[j+2])
+linkCode
+LinkID <- function(txt){ 
+    # If look-up fails, result is NA not numeric(0) or logical(0)
+    j <- match(txt,linkCode[,"link"])
+    id <- as.integer(linkCode[j,"code"]);
+    return(id);
+}    
+LinkID("isRelatedTo") # 21243
+LinkID("dog")
+```
+
+The creation of each edge involves matching the labels from pre-existing nodes.  PersonRT, PlaceRT,, are a proxy for nodes in neo4j. RT means "in RoundTable conventions") and provide matches between field names (actually, just _label_) and codes (ID, resource, type) for X-Z-Y. The functions are:  
+MatchID() - the _fromX_ field in a file of XhasY is matched to the _label_ field in XRT. Ditto _fromY_ the YRT. The unique ID, resource, and type within resource from XRT and YRT are returned.
+MakeEdge() -  assemble everything required for an edge X-Z-Y, but not the unique ID, suitable for export as write.csv() and writeJSON(). 3 numeric for fromX, 3 numeric for ToY, 3 numeric for Z, and 8 text fields for Z.  
+QueryCreateEdge () - creates a vector of Cypher queries that make neo4j links corresponding to RoundTable edges.
+
+Here I test the function QueryCreateEdge(). Note that _base_ is the list of text fields for a link/edge, so future changes to content are handled.
+
+```{r testQCE}
+# 8 text fields as of 2018-08-26
+
+base=data.frame(f1 <- c("label1","label2"),
+                f2 <- c("name1","name2"), 
+                f3 <- c("desc1","desc2"),
+                f5 <- c("yes1","yes2"),
+                f4 <- c("en1","en2"),
+                f6 <- c("active","active"),
+                f7 <- c("sd1","sd2"),
+                f8 <- c("ed1","ed2") );
+colnames(base) <- linkFieldName[10:17];
+cat("\n the base fields \n"); base; 
+cat("\n the toID and from ID \n");
+(fromID <- PersonRT$ID[1:2]); (toID <- PersonRT$ID[3:4]) # else MatchID()
+cat("\n the Cupher queries \n")
+query <- QueryCreateEdge("person",fromID,"person",toID,"isRelatedTo", base);
+
+```
+
+```{r linkFields}
+cat("\n the data.frame required for JSON \n")
+rt=data.frame(ID="999",)
+```
+
+
+## Person has Person
+The spreadsheet for this has almost no link as of 2018-08-03. 
+
+Testing MatchID()'
+Using just a few of (sparse) PersonHasPerson links.
+```{r testMatchID}
+from <- "person";              X <- PersonRT;
+link <- "isRelatedTo";      hasY <- PersonHasPerson;
+to <-   "person";              Y <- PersonRT;
+cat("from:",from, "\n", colnames(X),"\n");
+cat("\nlink:",link, "\n", colnames(hasY),"\n"); 
+cat("\nto:",  to, "\n",    colnames(Y),"\n\n");
+Xlabel <-    "label";   Ylabel <-    "label"; 
+hasXlabel <- "fromPerson";    hasYlabel <- "toPerson";
+type="how"
+hasY= hasY[ (hasY[,hasYlabel]!=""), ] # remove rows that are not links
+rt <- MatchID(X, Xlabel, hasY, hasXlabel, hasYlabel, Y)
+rt[(sample(length(rt),5)),]    
+```
+
+```{r testMakeEdge}
+from <- "person";              X <- PersonRT;
+link <- "isRelatedTo";      hasY <- PersonHasPerson;
+to <-   "person";              Y <- PersonRT;
+cat("from:",from, "\n", colnames(X),"\n");
+cat("\nlink:",link, "\n", colnames(hasY),"\n"); 
+cat("\nto:",  to, "\n",    colnames(Y),"\n\n");
+
+Xlabel <-    "label";   Ylabel <-    "label"; 
+hasXlabel <- "fromPerson";  hasYlabel <- "toPerson"; 
+type <- "how" # type will vary by row in data. link might vary by row.
+
+# cat("X is Resource",from,"with code", RTcode(from)[1],"and Xlabel",Xlabel,"\n");
+# cat("Y is  Resource", to,"with code", RTcode(to)[1]," and Ylabel",Ylabel,"\n");
+# cat("hasY is Edge", link," with types \'",type,"\' with codes codes",RTcode(link,"link",type=hasY[,type][1]), ", with hasXlabel",hasXlabel, ", and with hasYlabel", hasYlabel,"\n");
+
+tmp <- MakeEdge(from,to,link,type="how",description="description") %>% 
+    AddUID() %T>% write_json(path="testJSON.txt", pretty=TRUE);
+a <- read_json(path="testJSON.txt",simplifyVector = TRUE); # recover data.frame
+t(a[1,])
+
+# tmp <-MakeEdge("person","isRelatedTo","person",RT=TRUE)
+# tmp <- AddUID(tmp) # assumes uiid is "ID"
+# write_json(tmp,path="testJSON.txt", pretty=TRUE);
+# write.csv(tmp,file ="testMakeEdge.csv");
+```
+
+
+```{r PhP}
+from <- "person";           X <- PersonRT;
+link <- "isRelatedTo";  hasY <- PersonHasPerson;
+to <-   "person";           Y <- PersonRT;
+cat("from",from, "\n",    colnames(X),"\n");
+cat("\nlink",link, "\n",  colnames(hasY),"\n"); 
+cat("\nto",  to, "\n",    colnames(Y),"\n\n");
+Xlabel <-    "label";   Ylabel <-    "label"; 
+hasXlabel <- "fromPerson";  hasYlabel <- "toPerson"; 
+type <- "how" ; description="description"
+
+PersonHasPersonRT <- MakeEdge(from,to,link,type,description) %>%
+    AddUID %T>% write_json(path="../output/PersonHasPerson.json", pretty=TRUE);
+
+```
+
+## Activity Has Idea
+329 rows with 74 unique Activity, so average number of Idea for Activity is $329/74=4.4$  There are 252 unique Idea for Activity.  
+[I am experimenting with Chinese language idea that a plural is rarely necessary. Ditto articles. And pronouns.]
+ActivityRT is basis for (:Activity) in neo4j.
+IdeaRT and IdeaRT2 both become (:Idea{})
+Here we build Cypher query:
+>CREATE (:Activity{ID:99})-[hasIdea{type:9}]-(:Idea{ID:999})
+
+failed for "Loi sur les especes en peril (LEP)" because .csv ruins French accents.
+
+```{r ActivityHasIdea}
+from <- "activity";         X <- ActivityRT;
+link <- "hasIdea";       hasY <- ActivityHasIdeaTag;
+to <-   "idea";           Y <- IdeaRT;
+cat("from",from, "\n",    colnames(X),"\n");
+cat("\nlink",link, "\n",  colnames(hasY),"\n"); 
+cat("\nto",  to, "\n",    colnames(Y),"\n\n");
+Xlabel <-    "label";   Ylabel <-    "label"; 
+hasXlabel <- "Activity.name";  hasYlabel <- "IdeaTag.name"; 
+type <- "" ; description=""
+
+ActivityHasIdeaRT <- MakeEdge(from,to,link,type,description) %>%
+    AddUID %T>% write_json(path="../output/ActivityHasIdea.json", pretty=TRUE);
+
+```
+
+## Person Has Activity
+These are **Person** who responded to the survey and offered one or more of 90 **Activity**. Added the description available in _PersonHasActivity$role_. There are no types within **hasActivity**.
+
+```{r PhA}
+from <- "person";         X <- PersonRT;
+link <- "hasActivity"; hasY <- PersonHasActivity;
+to <-   "activity";       Y <- ActivityRT;
+cat("from",  from, "\n", colnames(X),"\n");
+cat("\nlink",link, "\n", colnames(hasY),"\n"); 
+cat("\nto",  to,   "\n", colnames(Y),"\n\n");
+Xlabel <-    "label";   Ylabel <-    "label"; 
+hasXlabel <- "Person.name"; hasYlabel <- "Activity.name"; 
+type <- "" ; description="role"
+
+PersonHasActivity2RT <- MakeEdge(from,to,link,type,description) %>%
+    AddUID %T>% write_json(path="../output/PersonHasActivity2.json", pretty=TRUE);
+```
+## Activity Has Person
+From _key people_ field in **Activity** from 2017 October survey. 223/325 **Person** are not in PersonR, leaving 102 valid. Many are Organization names, not Person names. 
+
+This has to be applied in reverse, RT does not have hasPerson, just **hasContactPerson**. Using **hasActivity**, code 21227.
+
+
+```{r AhP}
+from <- "person";         X <- PersonRT;
+link <- "hasActivity"; hasY <- ActivityHasPerson;
+to <-   "activity";       Y <- ActivityRT;
+cat("from",  from, "\n", colnames(X),"\n");
+cat("\nlink",link, "\n", colnames(hasY),"\n"); 
+cat("\nto",  to,   "\n", colnames(Y),"\n\n");
+Xlabel <-    "label";   Ylabel <-    "label"; 
+hasYlabel <- "Activity.name";  hasXlabel <- "Person.name"; # swapped
+type <- "" ; description=""
+
+PersonHasActivity2RT <- MakeEdge(from,to,link,type,description) %>%
+    AddUID %T>% write_json(path="../output/PersonHasActivity2.json", pretty=TRUE);
+```
+
+
+## Activity Has Place
+At this point only 6 of 216 matched from ActivityHasLocation derived from 2018-10-24 survey. That contains 143 unique _Location.name_. **Place** and **PlaceHasPlace** need to be greatly expanded.
+
+2018-08-27 JSC presented additional **Place** but not **PlaceHasPlace**
+"../nodesJSON_Aug27_2018/JSC_PlaceJSON.csv"  247 rows plus header. The French accents came through correctly.
+
+
+```{r AhPlace}
+Place2RT <- read.csv("../nodesJSON_Aug27_2018/JSC_PlaceJSON.csv")
+from <- "activity";    X <- ActivityRT;
+link <- "hasPlace"; hasY <- ActivityHasLocation;
+to <-   "place";       Y <- Place2RT;
+cat("from",  from, "\n", colnames(X),"\n");
+cat("\nlink",link, "\n", colnames(hasY),"\n"); 
+cat("\nto",  to,   "\n", colnames(Y),"\n\n");
+Xlabel <- Ylabel <- "label"; 
+hasXlabel <- "Activity.name";  hasYlabel <- "Location.name"; 
+# no type or description within link (yet)
+ActivityHasPlaceRT <- MakeEdge(from,to,link) %>%
+    AddUID %T>% write_json(path="../output/ActivityHasPlace.json", pretty=TRUE);
+```
+
+## Activity Has WebPage
+The link URL is _WebPageRT$URL_ as opposed to _WebPageRT$label._  
+
+
+```{r AhW}
+from <- "activity";      X <- ActivityRT;
+link <- "hasWebpage"; hasY <- ActivityHasWebPage;
+to <-   "webpage";       Y <- WebPageRT;
+cat("from",  from, "\n", colnames(X),"\n");
+cat("\nlink",link, "\n", colnames(hasY),"\n"); 
+cat("\nto",  to,   "\n", colnames(Y),"\n\n");
+Xlabel <- "label"; Ylabel <- "URL"
+hasXlabel <- "Activity.name";  hasYlabel <- "WebPage.name"; 
+ActivityHasWebPageRT <- MakeEdge(from,to,link) %>%
+    AddUID %T>% write_json(path="../output/ActivityHasWebPage.json", pretty=TRUE);
+```
+
+## Org Has Org 
+Here is a case where I would like the link to be
+*(:Organization)-[:hasOrganization]->(:Organization)*
+but the requirement is *(:Organization)-[:isRelatedTo]->(:Organization)*.
+Both are likely to be used as: *(:Organization)--(Organization)*. 
+If types within OrgHasOrg are important, the case for *hasOrganization* might re-emerge.
+
+```{r OhO}
+from <- "organization";      X <- OrganizationRT;
+link <- "isRelatedTo";    hasY <- OrgHasOrg;
+to <-   "organization";      Y <- OrganizationRT;
+EchoXhY();
+Xlabel <- Ylabel <-"label";
+hasXlabel <- "fromOrg.name";  hasYlabel <- "toOrg.name"; 
+OrgHasOrgRT <- MakeEdge(from,to,link) %>% AddUID %T>%
+    write_json(path="../output/OrgHasOrg.json", pretty=TRUE);
+```
+
+## Person Has ContactService
+The link *PersonHasContactService* has a single field _Person.name_ which applies to both _label_ in *Person* and _label_ in *ContactService*. 
+```{r PhCS}
+from <- "person";                X <- PersonRT;
+link <- "hasContactService";  hasY <- PersonHasContactService;
+to <-   "contactService";        Y <- ContactServiceRT;
+EchoXhY();
+Xlabel <- Ylabel <-"label";
+hasXlabel <- hasYlabel <- "Person.name"; 
+PersonHasContactServiceRT <- MakeEdge(from,to,link) %>% AddUID %T>%
+    write_json(path="../output/PersonHasContactService.json", pretty=TRUE);
+
+```
+
+## PersonHasIdeaTag
+*PersonHasIdeaTag* with 2,299 (was 3,551) rows refers to the 37 IYS topics. 
+Goes with *Idea3RT* that has 43 rows: 37 IYS topics plus 6 IYS themes. Topics: Field data, Data analysis, "Fisheries: manage, assess", Stock status assessment, Habitat assessment, Population identification, "Marine survival, growth, migration",.
+ 
+*PersonHasIdeaTagB* with 70 rows refers to keywords from Activity, goes with *Idea2RT*: Arctic char biology, Arctic monitoring, by-catch, collaboration buy-in, collaboration process, collaboration support systems, colonizing, Cypher, data management, DIDSON,.
+
+*ActivityHasIdea* goes with *IdeaRT*: Aboriginal organisations, Aboriginal organisations science, Aboriginal Organisations Science, acoustic tag tech, acoustic telemetry, acoustics, adipose clip, adult enumeration, adult returns, age,.
+
+
+```{r PhI1}
+from <- "person";      X <- PersonRT;
+link <- "hasIdea";  hasY <- PersonHasIdeaTag;
+to <-   "idea";        Y <- Idea3RT;
+EchoXhY();
+Xlabel <- Ylabel <-"label";
+hasXlabel <-  "Person.name"; hasYlabel <- "IdeaTag.name"
+PersonHasIdeaRT <- MakeEdge(from,to,link) %>% AddUID %T>%
+    write_json(path="../output/PersonHasIdea.json", pretty=TRUE);
+
+```
+
+
+```{r PhI2}
+from <- "person";      X <- PersonRT;
+link <- "hasIdea";  hasY <- PersonHasIdeaTagB;
+to <-   "idea";        Y <- Idea2RT;
+EchoXhY();
+Xlabel <- Ylabel <-"label";
+hasXlabel <-  "Person.name"; hasYlabel <- "IdeaTag.name"
+description <- "IdeaTag.description"
+PersonHasIdeaBRT <- MakeEdge(from,to,link,description = description) %>% AddUID %T>%
+    write_json(path="../output/PersonHasIdeaB.json", pretty=TRUE);
+
+```
+## Person Has Org
+```{r PhO}
+# clean up jobTitle and jobDescription in PersonHasOrg
+a1 <- PersonHasOrg$hasOrg.jobTitle
+a2 <- PersonHasOrg$hasOrg.jobDescription
+a1[is.na(a1)] <- ""; a2[is.na(a2)] <- ""; 
+a<- trimws(paste(a1,a2))
+PersonHasOrg$description <- a;
+
+from <- "person";              X <- PersonRT;
+link <- "hasOrganization";  hasY <- PersonHasOrg;
+to <-   "organization";        Y <- OrganizationRT;
+EchoXhY();
+Xlabel <- Ylabel <-"label";
+hasXlabel <-  "Person.name"; hasYlabel <- "Org.name"
+description <- "description"
+PersonHasOrgRT <- MakeEdge(from,to,link,description = description) %>% AddUID %T>%
+    write_json(path="../output/PersonHasOrg.json", pretty=TRUE);
+
+```
+
+## Person Has Place
+Here I use revised Place in Place2RT from "../nodesJSON_Aug27_2018/JSC_PlaceJSON.csv"
+
+```{r PhPlace}
+from <- "person";       X <- PersonRT;
+link <- "hasPlace";  hasY <- PersonHasPlace;
+to <-   "place";        Y <- Place2RT;
+EchoXhY();
+Xlabel <- Ylabel <-"label";
+hasXlabel <-  "Person.name"; hasYlabel <- "Place.name";
+PersonHasPlaceRT <- MakeEdge(from,to,link) %>% AddUID %T>%
+    write_json(path="../output/PersonHasPlace.json", pretty=TRUE);
+
+```
+
+## Place has Address
+revised: Place2RT
+```{r PhAddress}
+ColNames("PlaceRT");
+ColNames("PlaceHasAddress");
+ColNames("AddressRT");
+LinkID("hasAddress") # 21238
+X <- PlaceRT; Y <- AddressRT; Xlabel <- "label"; Ylabel <-"label";
+hasY <- PlaceHasAddress; 
+   hasXlabel <- "place";  hasYlabel <- "place"; 
+queryPlaceHasAddress <- MakeEdge("place","hasAddress","address");
+
+from <- "place";          X <- Place2RT;
+link <- "hasAddress";  hasY <- PlaceHasAddress;
+to <-   "address";        Y <- AddressRT;
+EchoXhY();
+Xlabel <- Ylabel <-"label";
+hasXlabel <-  "place"; hasYlabel <- "place";
+PlaceHasAddressRT <- MakeEdge(from,to,link) %>% AddUID %T>%
+    write_json(path="../output/PlaceHasAddress.json", pretty=TRUE);
+
+```
+
+## PlaceHasWebPage
+Only five of these, originally from PlaceHasAddress.
+```{r PhWP}
+
+from <- "place";          X <- Place2RT;
+link <- "hasWebpage";  hasY <- PlaceHasAddress;
+to <-   "webpage";        Y <- WebPage2RT;
+EchoXhY();
+Xlabel <- Ylabel <-"label";
+hasXlabel <- hasYlabel <- "place";
+PlaceHasWebPageRT <- MakeEdge(from,to,link) %>% AddUID %T>%
+    write_json(path="../output/PlaceHasWebPage.json", pretty=TRUE);
+
+```
+
+# Output
+```{r write_json}
+# a <- ls(pattern="query") %T>% print;
+# file=paste0("../data/", a, ".txt")
+# for(j in 1:length(a)){
+#     cat( get(a[j]), sep="\n", file = file[j] )
+# }
+```
+
+```{r asCSV}
+a <- ls(pattern="RT") %T>% print;
+file=paste0("../data/", a, ".csv")
+for(j in 1:length(a)) write.csv(get(a[j]), file[j])
+
+```
